@@ -17,6 +17,9 @@ module.exports = {
   heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_MS || 30_000), // ping 周期
   heartbeatTimeoutMs: Number(process.env.HEARTBEAT_TIMEOUT_MS || 75_000), // 超过该时长无 pong 判定死亡
 
+  // 在线状态
+  offlineGraceMs: Number(process.env.OFFLINE_GRACE_MS || 10_000), // 最后一条连接断开后的离线宽限窗口（防抖）
+
   // 可靠投递
   ackResendIntervalMs: Number(process.env.ACK_RESEND_INTERVAL_MS || 2_000), // 未 ACK 重发扫描周期
   ackResendAfterMs: Number(process.env.ACK_RESEND_AFTER_MS || 3_000), // 发送后多久未收到 ACK 触发重发

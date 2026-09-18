@@ -32,8 +32,11 @@
   #composer input { flex: 1; }
   #members { width: 200px; background: #161d2e; padding: 12px; overflow-y: auto; }
   #members .m { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 13px; }
-  #members .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
+  #members .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; flex: none; }
   #members .dot.on { background: #3ecf6e; }
+  #members .m .info { min-width: 0; }
+  #members .m .who { display: flex; align-items: center; gap: 6px; }
+  #members .seen { font-size: 11px; color: #7f8db3; }
   #members .tag { font-size: 11px; color: #f0b429; }
   #members .tag.muted { color: #e05252; }
   #members button { padding: 2px 6px; font-size: 11px; margin-left: auto; }
@@ -86,6 +89,7 @@
 const $ = (id) => document.getElementById(id);
 let ws = null, me = null, currentRoom = null;
 const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
+const membersByRoom = new Map(); // roomId -> Map(userId -> 成员快照)：members 响应打底 + presence 帧实时 patch
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
 
 const store = {
@@ -181,9 +185,31 @@ function handle(m) {
       refreshMembers();
       break;
     }
-    case 'members':
-      if (m.roomId === currentRoom) renderMembers(m.members);
+    case 'members': {
+      // 服务端权威快照打底，后续由 presence 帧实时增量修正
+      const map = new Map();
+      for (const m of m.members) map.set(m.userId, m);
+      membersByRoom.set(m.roomId, map);
+      if (m.roomId === currentRoom) renderMembers();
       break;
+    }
+    case 'presence': {
+      // 房间通知：成员上线 / 离线（离线仅在宽限窗口结束后发出）
+      let map = membersByRoom.get(m.roomId);
+      if (!map) { map = new Map(); membersByRoom.set(m.roomId, map); }
+      const cur = map.get(m.userId);
+      map.set(m.userId, {
+        ...cur,
+        userId: m.userId,
+        name: m.name || cur?.name || m.userId,
+        role: cur?.role,
+        mutedUntil: cur?.mutedUntil || 0,
+        online: m.online,
+        lastActiveAt: m.lastActiveAt,
+      });
+      if (m.roomId === currentRoom) renderMembers();
+      break;
+    }
     case 'error':
       sys(currentRoom, `错误 [${m.code}] ${m.message}`);
       break;
@@ -249,18 +275,25 @@ function render() {
   $('msgInput').disabled = muted;
 }
 
-// 把 members 响应接进渲染
-function renderMembers(list) {
+// 成员列表由缓存快照渲染（members 响应打底，presence 帧实时修正）
+function renderMembers() {
   const r = rooms.get(currentRoom); if (!r) return;
+  const list = [...(membersByRoom.get(currentRoom) || new Map()).values()];
+  list.sort((a, b) => Number(b.online) - Number(a.online)); // 在线成员排在前面
   $('members').innerHTML = '<b>成员</b>' + list.map((m) => {
     const muted = m.mutedUntil > Date.now();
     const adminBtns = r.role === 'admin' && m.userId !== me.userId && m.role !== 'admin'
       ? (muted ? `<button data-act="unmute" data-uid="${m.userId}">解禁</button>`
                : `<button data-act="mute" data-uid="${m.userId}">禁言</button>`) : '';
-    return `<div class="m"><span class="dot ${m.online ? 'on' : ''}"></span>
-      ${escapeHtml(m.name)}
-      ${m.role === 'admin' ? '<span class="tag">管理员</span>' : ''}
-      ${muted ? '<span class="tag muted">禁言中</span>' : ''}
+    return `<div class="m">
+      <span class="dot ${m.online ? 'on' : ''}" title="${m.online ? '在线' : '离线'}"></span>
+      <span class="info">
+        <span class="who">${escapeHtml(m.name || m.userId)}
+          ${m.role === 'admin' ? '<span class="tag">管理员</span>' : ''}
+          ${muted ? '<span class="tag muted">禁言中</span>' : ''}
+        </span>
+        <span class="seen">${formatSeen(m)}</span>
+      </span>
       ${adminBtns}</div>`;
   }).join('');
   $('members').querySelectorAll('button').forEach((b) => {
@@ -274,6 +307,27 @@ function renderMembers(list) {
     };
   });
 }
+
+/** 在线状态文案：在线显示最近活动；离线显示「最近活跃 x 前」 */
+function formatSeen(m) {
+  if (!m.lastActiveAt) return m.online ? '在线' : '离线';
+  const diff = Date.now() - m.lastActiveAt;
+  if (m.online) return diff < 60_000 ? '在线 · 刚刚活跃' : `在线 · ${formatDuration(diff)}内活跃`;
+  return `最近活跃 ${formatDuration(diff)}前`;
+}
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}秒`;
+  const min = Math.floor(s / 60);
+  if (min < 60) return `${min}分钟`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}小时`;
+  return `${Math.floor(h / 24)}天`;
+}
+
+// 离线后的相对时间随时间推移也需要刷新（在线状态本身由 presence 帧驱动）
+setInterval(() => { if (currentRoom && !$('members').classList.contains('hidden')) renderMembers(); }, 30_000);
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

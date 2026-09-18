@@ -21,10 +21,11 @@ PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = FULL;
 
 CREATE TABLE IF NOT EXISTS users (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL UNIQUE,
-  token_random TEXT NOT NULL,
-  created_at   INTEGER NOT NULL
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  token_random  TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  last_active_at INTEGER NOT NULL DEFAULT 0  -- 最近活动时间（在线状态展示的离线兜底）
 );
 
 CREATE TABLE IF NOT EXISTS rooms (
@@ -75,7 +76,16 @@ class ChatDB {
   constructor(dbPath) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(SCHEMA);
+    this._migrate();
     this._prepare();
+  }
+
+  /** 旧库补列（CREATE TABLE IF NOT EXISTS 不会改动已存在的表） */
+  _migrate() {
+    const cols = this.db.prepare('PRAGMA table_info(users)').all();
+    if (!cols.some((c) => c.name === 'last_active_at')) {
+      this.db.exec('ALTER TABLE users ADD COLUMN last_active_at INTEGER NOT NULL DEFAULT 0');
+    }
   }
 
   _prepare() {
@@ -84,6 +94,7 @@ class ChatDB {
       insertUser: d.prepare('INSERT INTO users (id, name, token_random, created_at) VALUES (?, ?, ?, ?)'),
       userByName: d.prepare('SELECT * FROM users WHERE name = ?'),
       userById: d.prepare('SELECT * FROM users WHERE id = ?'),
+      setUserActive: d.prepare('UPDATE users SET last_active_at = ? WHERE id = ?'),
 
       insertRoom: d.prepare('INSERT INTO rooms (id, name, created_by, created_at) VALUES (?, ?, ?, ?)'),
       roomById: d.prepare('SELECT * FROM rooms WHERE id = ?'),
@@ -102,7 +113,8 @@ class ChatDB {
       member: d.prepare('SELECT * FROM members WHERE room_id = ? AND user_id = ?'),
       setMuted: d.prepare('UPDATE members SET muted_until = ? WHERE room_id = ? AND user_id = ?'),
       membersOfRoom: d.prepare(
-        `SELECT m.user_id AS userId, u.name, m.role, m.muted_until AS mutedUntil
+        `SELECT m.user_id AS userId, u.name, m.role, m.muted_until AS mutedUntil,
+                u.last_active_at AS lastActiveAt
            FROM members m JOIN users u ON u.id = m.user_id WHERE m.room_id = ?`
       ),
 
@@ -153,6 +165,11 @@ class ChatDB {
 
   getUserByName(name) { return this.stmt.userByName.get(name); }
   getUserById(id) { return this.stmt.userById.get(id); }
+
+  /** 更新用户最近活动时间（连接建立/心跳/收帧） */
+  setUserActive(userId, ts = now()) {
+    this.stmt.setUserActive.run(ts, userId);
+  }
 
   // ---------- 房间与成员 ----------
 

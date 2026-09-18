@@ -446,3 +446,168 @@ test('持久化：服务重启后消息不丢失', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------- 在线状态同步
+
+const isBobPresence = (m, userId, online = undefined) =>
+  m.type === 'presence' && m.userId === userId &&
+  (online === undefined ? true : m.online === online);
+
+test('成员入房广播上线；最后连接断开经宽限后广播离线，成员查询全程可查', async () => {
+  const { server, port } = await startServer({ offlineGraceMs: 200 });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+
+    // —— 加入房间事件：房间内广播上线 ——
+    const on = await a.waitFor((m) => isBobPresence(m, ub.userId, true));
+    assert.equal(on.name, 'bob');
+    assert.ok(on.lastActiveAt > 0);
+
+    const queryBob = async () => {
+      a.send({ type: 'members', roomId });
+      const res = await a.waitFor((m) => m.type === 'members');
+      return res.members.find((x) => x.userId === ub.userId);
+    };
+    let bm = await queryBob();
+    assert.equal(bm.online, true, '成员查询显示在线');
+    assert.ok(bm.lastActiveAt > 0, '成员查询带最近活动时间');
+
+    // —— 连接关闭事件：宽限窗口内仍显示在线，且不发离线广播 ——
+    await b.close();
+    await sleep(80);
+    bm = await queryBob();
+    assert.equal(bm.online, true, '宽限窗口内外显状态仍为在线');
+    assert.ok(
+      !a.log.some((m) => isBobPresence(m, ub.userId, false)),
+      '宽限未到期不应广播离线'
+    );
+
+    // —— 宽限到期：广播离线，最近活动时间随帧下发 ——
+    const off = await a.waitFor((m) => isBobPresence(m, ub.userId, false));
+    assert.ok(off.lastActiveAt > 0);
+    bm = await queryBob();
+    assert.equal(bm.online, false, '宽限到期后成员查询显示离线');
+    assert.ok(bm.lastActiveAt > 0, '离线成员仍可查到最近活动时间（DB 兜底）');
+
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('连接抖动：宽限窗口内重连，在线状态不发生反复跳变', async () => {
+  const { server, port } = await startServer({ offlineGraceMs: 500 });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    let b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await a.waitFor((m) => isBobPresence(m, ub.userId, true));
+
+    await b.close();           // 断线
+    await sleep(150);          // 未超过宽限窗口
+    b = await Client.connect(port, ub.token);
+    await joinRoom(b, roomId, 0); // 快速重连并入房
+    await sleep(700);          // 跨过原宽限时刻（500ms）
+
+    const events = a.log.filter((m) => isBobPresence(m, ub.userId));
+    assert.deepEqual(
+      events.map((e) => e.online),
+      [true],
+      '整个抖动过程中只应有一次上线广播，无离线跳变、无重复上线'
+    );
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('多设备：该用户在房间的所有连接全部断开后才判定离线', async () => {
+  const { server, port } = await startServer({ offlineGraceMs: 200 });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b1 = await Client.connect(port, ub.token);
+    const b2 = await Client.connect(port, ub.token); // bob 的第二台设备
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b1, roomId);
+    await a.waitFor((m) => isBobPresence(m, ub.userId, true));
+    await joinRoom(b2, roomId); // 同用户第二设备入房不重复广播上线
+
+    await b1.close(); // 只断一台
+    await sleep(500); // 远超宽限窗口
+    assert.ok(
+      !a.log.some((m) => isBobPresence(m, ub.userId, false)),
+      '仍有一台设备在线，不得判定离线'
+    );
+    a.send({ type: 'members', roomId });
+    const res = await a.waitFor((m) => m.type === 'members');
+    assert.equal(res.members.find((x) => x.userId === ub.userId).online, true);
+
+    await b2.close(); // 最后一台也断开
+    await a.waitFor((m) => isBobPresence(m, ub.userId, false), 2000);
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('心跳超时：无 pong 的连接被清理，宽限后判定离线', async () => {
+  const { server, port } = await startServer({ offlineGraceMs: 100 });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await a.waitFor((m) => isBobPresence(m, ub.userId, true));
+
+    // 模拟心跳超时：直接把末次 pong 置旧后触发扫描（ws 客户端默认自动回 pong）
+    const [bobConn] = server.hub.byUser.get(ub.userId);
+    bobConn.lastPong = 0;
+    server.hub.heartbeatSweep();
+    await b.closed; // 连接被 terminate
+
+    const off = await a.waitFor((m) => isBobPresence(m, ub.userId, false), 2000);
+    assert.ok(off.lastActiveAt > 0, '心跳超时判离线时带上最近活动时间');
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('主动 leave 房间：立即广播离线，不等待宽限窗口', async () => {
+  const { server, port } = await startServer({ offlineGraceMs: 5_000 });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await a.waitFor((m) => isBobPresence(m, ub.userId, true));
+
+    b.send({ type: 'leave', roomId });
+    await b.waitFor((m) => m.type === 'left' && m.roomId === roomId);
+    await sleep(300); // 宽限为 5s，这里只等 300ms
+    const off = a.log.find((m) => isBobPresence(m, ub.userId, false));
+    assert.ok(off, '主动离开应立即广播离线，不经过宽限等待');
+
+    a.send({ type: 'members', roomId });
+    const res = await a.waitFor((m) => m.type === 'members');
+    assert.equal(res.members.find((x) => x.userId === ub.userId).online, false);
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});

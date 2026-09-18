@@ -204,8 +204,16 @@ function createChatServer(overrides = {}) {
     members(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
       requireMember(conn, msg.roomId);
-      const online = new Set(hub.onlineUserIds(msg.roomId));
-      const members = db.listMembers(msg.roomId).map((m) => ({ ...m, online: online.has(m.userId) }));
+      // 实时 presence（含宽限窗口内的用户，对外仍显示在线）合并 DB 离线兜底信息
+      const live = hub.presenceInRoom(msg.roomId);
+      const members = db.listMembers(msg.roomId).map((m) => {
+        const p = live.get(m.userId);
+        return {
+          ...m,
+          online: p !== undefined,
+          lastActiveAt: p ? p.lastActiveAt : (m.lastActiveAt || 0),
+        };
+      });
       hub.send(conn, { type: 'members', roomId: msg.roomId, members });
     },
 
@@ -251,6 +259,7 @@ function createChatServer(overrides = {}) {
       hub.send(conn, { type: 'error', code: 'BAD_FRAME', message: 'invalid JSON frame' });
       return;
     }
+    hub.touch(conn); // 任意有效帧都算一次活动，刷新最近活动时间
     const handler = handlers[msg.type];
     if (!handler) {
       hub.send(conn, { type: 'error', code: 'UNKNOWN_TYPE', message: `unknown type: ${msg.type}` });
@@ -272,6 +281,15 @@ function createChatServer(overrides = {}) {
       }
     }
   }
+
+  // ---------------------------------------------------------------- Presence 同步
+
+  // 在线状态变更（上线 / 宽限到期离线）→ 房间通知广播；
+  // 离线时同步把最近活动时间落库，作为 members 查询的离线兜底数据。
+  hub.onPresence((evt) => {
+    if (!evt.online) db.setUserActive(evt.userId, evt.lastActiveAt);
+    hub.broadcast(evt.roomId, { type: 'presence', ...evt });
+  });
 
   // ---------------------------------------------------------------- HTTP 层
 
@@ -363,9 +381,11 @@ function createChatServer(overrides = {}) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       const conn = new Connection(ws, user);
       hub.add(conn);
+      db.setUserActive(user.id, conn.connectedAt); // 连接建立事件：记录活动
 
       ws.on('pong', () => {
         conn.lastPong = now();
+        hub.touch(conn); // pong 同样视为活动
       });
       ws.on('message', (raw) => onFrame(conn, raw));
       ws.on('close', () => hub.remove(conn));
@@ -397,6 +417,7 @@ function createChatServer(overrides = {}) {
 
   function stop() {
     for (const t of timers) clearInterval(t);
+    hub.stop(); // 撤销离线宽限定时器、摘除 presence 监听（须在 db.close 之前）
     for (const conn of [...hub.all]) {
       hub.send(conn, { type: 'server_shutdown' });
       conn.ws.terminate();
