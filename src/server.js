@@ -72,6 +72,18 @@ function createChatServer(overrides = {}) {
   const limiter = new TokenBucket(config.rateLimitPerSec, config.rateLimitBurst);
   const publicDir = path.join(__dirname, '..', 'public');
 
+  // Presence 状态变化（上线 / 宽限期满离线）实时广播给房间全体连接
+  hub.emit = (ev) => {
+    hub.broadcast(ev.roomId, {
+      type: 'presence',
+      roomId: ev.roomId,
+      userId: ev.userId,
+      name: ev.name,
+      online: ev.kind === 'online',
+      lastActiveAt: ev.lastActiveAt,
+    });
+  };
+
   // ---------------------------------------------------------------- 消息处理
 
   /** 断线补发：把 roomId 中 seq > fromSeq 的消息按序推给连接，分批，客户端按 sync_done 续拉 */
@@ -204,8 +216,11 @@ function createChatServer(overrides = {}) {
     members(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
       requireMember(conn, msg.roomId);
-      const online = new Set(hub.onlineUserIds(msg.roomId));
-      const members = db.listMembers(msg.roomId).map((m) => ({ ...m, online: online.has(m.userId) }));
+      const presence = hub.roomPresence(msg.roomId);
+      const members = db.listMembers(msg.roomId).map((m) => {
+        const st = presence.get(m.userId);
+        return { ...m, online: Boolean(st?.online), lastActiveAt: st?.lastActiveAt || 0 };
+      });
       hub.send(conn, { type: 'members', roomId: msg.roomId, members });
     },
 
@@ -246,6 +261,7 @@ function createChatServer(overrides = {}) {
   };
 
   function onFrame(conn, raw) {
+    hub.markActive(conn); // 任意入站帧都算一次用户活动
     const msg = parseFrame(raw);
     if (!msg) {
       hub.send(conn, { type: 'error', code: 'BAD_FRAME', message: 'invalid JSON frame' });
@@ -366,6 +382,7 @@ function createChatServer(overrides = {}) {
 
       ws.on('pong', () => {
         conn.lastPong = now();
+        hub.markActive(conn); // pong 也代表设备存活活动
       });
       ws.on('message', (raw) => onFrame(conn, raw));
       ws.on('close', () => hub.remove(conn));
@@ -380,6 +397,7 @@ function createChatServer(overrides = {}) {
   const timers = [
     setInterval(() => hub.heartbeatSweep(), config.heartbeatIntervalMs),
     setInterval(() => hub.resendSweep(), config.ackResendIntervalMs),
+    setInterval(() => hub.presenceSweep(), config.presenceSweepIntervalMs),
   ];
   for (const t of timers) t.unref();
 

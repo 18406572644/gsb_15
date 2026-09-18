@@ -446,3 +446,225 @@ test('持久化：服务重启后消息不丢失', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------- 在线状态（Presence）
+
+const PRESENCE = { presenceGraceMs: 300, presenceSweepIntervalMs: 50 };
+
+function presenceEvents(client, userId) {
+  return client.log.filter(
+    (m) => m.type === 'presence' && (userId ? m.userId === userId : true)
+  );
+}
+
+async function queryMembers(client, roomId) {
+  client.send({ type: 'members', roomId });
+  const m = await client.waitFor((x) => x.type === 'members' && x.roomId === roomId);
+  return m.members;
+}
+
+test('Presence：成员加入实时推 online，members 查询带在线状态与最近活动时间', async () => {
+  const { server, port } = await startServer(PRESENCE);
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+
+    await joinRoom(b, roomId);
+    const ev = await a.waitFor(
+      (m) => m.type === 'presence' && m.roomId === roomId && m.userId === ub.userId
+    );
+    assert.equal(ev.online, true);
+    assert.equal(ev.name, 'bob');
+    assert.ok(Number.isInteger(ev.lastActiveAt) && ev.lastActiveAt > 0);
+
+    const list = await queryMembers(a, roomId);
+    const bob = list.find((m) => m.userId === ub.userId);
+    assert.equal(bob.online, true);
+    assert.ok(bob.lastActiveAt > 0);
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('Presence：最后一条连接断开后宽限期内仍报在线，宽限期满才推 offline', async () => {
+  const { server, port } = await startServer(PRESENCE);
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await a.waitFor((m) => m.type === 'presence' && m.userId === ub.userId && m.online);
+
+    await b.close();
+    // 宽限期内：查询接口仍视为在线（不抖）
+    await sleep(100);
+    let list = await queryMembers(a, roomId);
+    assert.equal(list.find((m) => m.userId === ub.userId).online, true, '宽限期内不应报离线');
+    assert.equal(presenceEvents(a, ub.userId).filter((m) => !m.online).length, 0);
+
+    // 宽限期满：恰好一次 offline，lastActiveAt 保留
+    const off = await a.waitFor(
+      (m) => m.type === 'presence' && m.userId === ub.userId && m.online === false,
+      3000
+    );
+    assert.ok(off.lastActiveAt > 0);
+    await sleep(100);
+    assert.equal(
+      presenceEvents(a, ub.userId).filter((m) => !m.online).length, 1, 'offline 只应通知一次'
+    );
+    list = await queryMembers(a, roomId);
+    assert.equal(list.find((m) => m.userId === ub.userId).online, false);
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('Presence：宽限期内重连回房，整段抖动对其他成员不可见（无 offline、无重复 online）', async () => {
+  const { server, port } = await startServer(PRESENCE);
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    let b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await a.waitFor((m) => m.type === 'presence' && m.userId === ub.userId && m.online);
+
+    await b.close();
+    await sleep(120); // 仍在 300ms 宽限内
+    b = await Client.connect(port, ub.token);
+    await joinRoom(b, roomId);
+    await sleep(600); // 跨过宽限期与多轮扫描
+
+    const evs = presenceEvents(a, ub.userId);
+    assert.equal(evs.length, 1, '抖动收敛：只有最初的一次 online');
+    assert.equal(evs[0].online, true);
+    const list = await queryMembers(a, roomId);
+    assert.equal(list.find((m) => m.userId === ub.userId).online, true);
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('Presence：多设备在线时一台断开不离线，全部断开才离线', async () => {
+  const { server, port } = await startServer(PRESENCE);
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b1 = await Client.connect(port, ub.token);
+    const b2 = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b1, roomId);
+    await joinRoom(b2, roomId);
+    await a.waitFor((m) => m.type === 'presence' && m.userId === ub.userId && m.online);
+
+    await b1.close(); // 设备 1 断开，设备 2 仍在
+    await sleep(600); // 跨过多轮宽限扫描
+    assert.equal(
+      presenceEvents(a, ub.userId).filter((m) => !m.online).length, 0,
+      '同账号仍有设备在房间，不应判离线'
+    );
+    let list = await queryMembers(a, roomId);
+    assert.equal(list.find((m) => m.userId === ub.userId).online, true);
+
+    await b2.close(); // 最后一台断开
+    await a.waitFor(
+      (m) => m.type === 'presence' && m.userId === ub.userId && m.online === false,
+      3000
+    );
+    list = await queryMembers(a, roomId);
+    assert.equal(list.find((m) => m.userId === ub.userId).online, false);
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('Presence：心跳超时 terminate 后走同一离线流程', async () => {
+  const { server, port } = await startServer(PRESENCE);
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await a.waitFor((m) => m.type === 'presence' && m.userId === ub.userId && m.online);
+
+    // 直接把该连接的 pong 时间调旧并触发心跳扫描：事件 4 -> terminate -> close
+    const conn = [...server.hub.all].find((c) => c.userId === ub.userId);
+    conn.lastPong = 0;
+    server.hub.heartbeatSweep();
+    await b.closed;
+
+    const off = await a.waitFor(
+      (m) => m.type === 'presence' && m.userId === ub.userId && m.online === false,
+      3000
+    );
+    assert.ok(off);
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('Presence：用户活动（帧/pong）刷新最近活动时间；重启后在线视图清空', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-presence-'));
+  const dbPath = path.join(dir, 'test.db');
+  try {
+    let roomId;
+    {
+      const { server, port } = await startServer({ dbPath, ...PRESENCE });
+      try {
+        const ua = await login(port, 'alice');
+        const ub = await login(port, 'bob');
+        const a = await Client.connect(port, ua.token);
+        const b = await Client.connect(port, ub.token);
+        roomId = await createRoom(a, 'general');
+        await joinRoom(b, roomId);
+        let list = await queryMembers(a, roomId);
+        const before = list.find((m) => m.userId === ub.userId).lastActiveAt;
+        await sleep(5);
+        b.send({ type: 'ping', t: 1 }); // 任意入站帧都算活动
+        await b.waitFor((m) => m.type === 'pong');
+        list = await queryMembers(a, roomId);
+        const after = list.find((m) => m.userId === ub.userId).lastActiveAt;
+        assert.ok(after >= before, '活动时间应随入站帧刷新');
+        await a.close();
+        await b.close();
+      } finally {
+        server.stop();
+      }
+    }
+
+    // Presence 注册表为进程内状态：重启后成员全部离线、lastActiveAt 归零，等设备重新上线
+    {
+      const { server, port } = await startServer({ dbPath, ...PRESENCE });
+      try {
+        const ua = await login(port, 'alice');
+        const a2 = await Client.connect(port, ua.token);
+        await joinRoom(a2, roomId, 0);
+        const list = await queryMembers(a2, roomId);
+        const bob = list.find((m) => m.name === 'bob');
+        assert.equal(bob.online, false);
+        assert.equal(bob.lastActiveAt, 0);
+        await a2.close();
+      } finally {
+        server.stop();
+      }
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

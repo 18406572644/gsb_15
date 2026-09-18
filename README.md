@@ -8,6 +8,9 @@
 - **幂等去重**：`clientMsgId` 唯一约束防发送重试产生重复；客户端按 `seq` 过滤重复投递
 - **消息时序可控**：每房间单调递增 `seq`，由计数器在写事务内分配，保证房间内全序
 - **连接管理**：心跳保活、全局/单用户连接数上限、背压断开、优雅退出
+- **成员在线状态**：连接建立 / 加入房间 / 连接关闭 / 心跳超时四类事件驱动；多设备
+  聚合（全部设备断开才判离线）；断开宽限抑制网络抖动导致的状态反复跳变；
+  `presence` 帧房间内实时推送，`members` 查询返回 `online` 与 `lastActiveAt`
 - **房间权限**：管理员 / 成员 / 禁言三种状态，管理员可禁言、解禁
 - **发送限流**：按用户令牌桶
 
@@ -16,7 +19,7 @@
 ```bash
 npm install
 npm start          # http://localhost:8080
-npm test           # 13 个集成测试
+npm test           # 19 个集成测试
 ```
 
 浏览器打开 `http://localhost:8080`，用不同昵称开两个标签页即可体验（建房、发消息、
@@ -30,7 +33,7 @@ npm test           # 13 个集成测试
 src/
 ├── config.js   配置（端口、连接上限、心跳、重发、限流，均可环境变量覆盖）
 ├── db.js       SQLite 持久层：schema、幂等写入、seq 分配、游标
-├── hub.js      连接注册中心：房间索引、广播、未 ACK 追踪、心跳/重发扫描
+├── hub.js      连接注册中心：房间索引、广播、未 ACK 追踪、心跳/重发扫描、Presence 在线状态表
 ├── server.js   HTTP + WS 服务：认证、消息路由、权限检查、限流、生命周期
 └── util.js     token 签名、帧解析等工具
 public/index.html   演示客户端（实现完整可靠投递协议）
@@ -88,6 +91,32 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 `seq` 由 `rooms.last_seq` 在写事务内递增分配（单写者 + 事务 = 无空洞、无并发交错），
 房间内消息严格全序。客户端凭 seq 即可检测空洞并触发补发，无需依赖时钟。
 
+### 6. 成员在线状态（Presence）
+
+在线状态以**用户**为单位聚合其全部设备连接，由四类生命周期事件驱动：
+
+| 事件 | 处理 |
+|---|---|
+| 连接建立 | 注册用户连接；宽限期内接入直接撤销待判离线 |
+| 加入房间 | 房间内首次有该用户设备在场 → 广播 `presence(online=true)` |
+| 连接关闭 | 逐房间进入断开宽限期；同账号还有其他设备在房则保持在线 |
+| 心跳超时 | `terminate()` 后触发 close，与连接关闭走同一条清理路径 |
+
+**多设备聚合**：同一用户可有多条连接（上限 `MAX_CONNECTIONS_PER_USER`）。
+一个房间内只要还有一条该用户的连接，就保持在线；最后一条连接断开时
+**不立即发离线通知**，而是进入 `PRESENCE_GRACE_MS`（默认 5 秒）宽限期：
+
+- 宽限期内查询 `members` 仍报 `online=true`，且**不推送** `offline`；
+- 宽限期内重连并重新加入房间（典型的网络抖动 / 快速刷新页面）：
+  静默撤销宽限，其他成员既收不到 `offline` 也不会收到重复的 `online`；
+- 宽限期满仍未回归：`presenceSweep` 广播一次且仅一次 `offline`。
+
+由此保证同一 (房间, 用户) 的 `online/offline` 通知**严格交替、无毛刺**。
+
+`lastActiveAt` 取该用户所有连接上最新活动时间（建连、收到任意入站帧、
+收到 pong 均刷新）。Presence 是进程内运行时状态，**不落库**：服务器
+重启后所有人报离线，由设备重连后重新建立状态，语义清晰、无陈旧在线。
+
 ## 协议（JSON 文本帧）
 
 ### 客户端 → 服务端
@@ -103,7 +132,7 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `sync` | `roomId, lastSeq?` | 请求补发 |
 | `history` | `roomId, beforeSeq?, limit?` | 历史翻页（升序返回） |
 | `rooms` | — | 我加入的房间列表 |
-| `members` | `roomId` | 成员列表（含在线状态） |
+| `members` | `roomId` | 成员列表，每项含 `online` 与 `lastActiveAt` |
 | `mute` | `roomId, userId, minutes` | 禁言（仅管理员，1..1440 分钟） |
 | `unmute` | `roomId, userId` | 解除禁言（仅管理员） |
 
@@ -116,7 +145,8 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `msg` | 房间消息：`{roomId, seq, clientMsgId, from, fromName, content, ts}` |
 | `ack` | 发送确认：`{roomId, clientMsgId, seq, ts}` |
 | `sync_done` | 一批补发结束：`{roomId, lastSeq, hasMore}` |
-| `history` / `rooms` / `members` | 对应查询的响应 |
+| `history` / `rooms` / `members` | 对应查询的响应；`members` 每项为 `{userId, name, role, mutedUntil, online, lastActiveAt}` |
+| `presence` | 房间内成员在线状态变化（服务端已去抖，收到即最终状态）：`{roomId, userId, name, online, lastActiveAt}` |
 | `notice` | 房间事件（`muted` / `unmuted`） |
 | `error` | `{code, message, ref?}`，code 见下 |
 | `server_shutdown` | 服务即将关闭，请准备重连 |
@@ -141,6 +171,8 @@ GET  /ws?token=<token>            →  WebSocket 升级
 | `MAX_CONNECTIONS` | `1000` | 全局并发连接上限 |
 | `MAX_CONNECTIONS_PER_USER` | `3` | 单用户连接上限（多端） |
 | `HEARTBEAT_INTERVAL_MS` / `HEARTBEAT_TIMEOUT_MS` | `30000` / `75000` | 心跳周期 / 判死超时 |
+| `PRESENCE_GRACE_MS` | `5000` | 最后一条设备连接断开后的离线宽限，期内回归不产生状态跳变 |
+| `PRESENCE_SWEEP_INTERVAL_MS` | `1000` | 宽限到期扫描周期（offline 通知延迟精度） |
 | `ACK_RESEND_AFTER_MS` / `ACK_MAX_RESEND` | `3000` / `5` | 未 ACK 重发阈值 / 最大次数 |
 | `MAX_UNACKED_PER_CONN` | `1000` | 单连接未确认积压上限（背压） |
 | `RATE_LIMIT_PER_SEC` / `RATE_LIMIT_BURST` | `10` / `20` | 发送限流令牌桶 |

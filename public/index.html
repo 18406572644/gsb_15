@@ -32,8 +32,10 @@
   #composer input { flex: 1; }
   #members { width: 200px; background: #161d2e; padding: 12px; overflow-y: auto; }
   #members .m { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 13px; }
-  #members .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
+  #members .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; flex: none; }
   #members .dot.on { background: #3ecf6e; }
+  #members .m .info { display: flex; flex-direction: column; min-width: 0; }
+  #members .m .info .sub { font-size: 11px; color: #7f8db3; }
   #members .tag { font-size: 11px; color: #f0b429; }
   #members .tag.muted { color: #e05252; }
   #members button { padding: 2px 6px; font-size: 11px; margin-left: auto; }
@@ -87,6 +89,7 @@ const $ = (id) => document.getElementById(id);
 let ws = null, me = null, currentRoom = null;
 const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
+let memberCache = []; // 当前房间成员列表（members 全量 + presence 增量维护）
 
 const store = {
   key: () => 'chat:' + me.name,
@@ -182,8 +185,21 @@ function handle(m) {
       break;
     }
     case 'members':
-      if (m.roomId === currentRoom) renderMembers(m.members);
+      if (m.roomId === currentRoom) { memberCache = m.members; renderMembers(memberCache); }
       break;
+    case 'presence': {
+      // 房间内成员在线状态实时推送（服务端已做宽限去抖，收到即为最终状态）
+      if (m.roomId !== currentRoom) break;
+      const idx = memberCache.findIndex((x) => x.userId === m.userId);
+      if (idx >= 0) {
+        memberCache[idx] = { ...memberCache[idx], online: m.online, lastActiveAt: m.lastActiveAt };
+      } else {
+        memberCache.push({ userId: m.userId, name: m.name, role: 'member', mutedUntil: 0,
+                          online: m.online, lastActiveAt: m.lastActiveAt });
+      }
+      renderMembers(memberCache);
+      break;
+    }
     case 'error':
       sys(currentRoom, `错误 [${m.code}] ${m.message}`);
       break;
@@ -200,7 +216,8 @@ function scheduleAck() {
 }
 
 function refreshMembers() { if (currentRoom) send({ type: 'members', roomId: currentRoom }); }
-setInterval(refreshMembers, 5000);
+// 在线状态由 presence 帧实时推送；定时查询仅作为成员名单/角色变更的兜底对账
+setInterval(refreshMembers, 15_000);
 
 // 未 ACK 的消息每秒重发一次（clientMsgId 不变，服务端幂等）
 retryTimer = setInterval(() => {
@@ -226,7 +243,11 @@ function renderRooms() {
        <span class="badge">${r.role === 'admin' ? '管理员' : ''}</span>
      </div>`).join('');
   for (const el of $('roomList').children) {
-    el.onclick = () => { currentRoom = el.dataset.id; renderRooms(); render(); refreshMembers(); };
+    el.onclick = () => {
+      currentRoom = el.dataset.id;
+      memberCache = []; // 等该房间的 members 全量响应重建
+      renderRooms(); render(); refreshMembers();
+    };
   }
 }
 
@@ -249,18 +270,23 @@ function render() {
   $('msgInput').disabled = muted;
 }
 
-// 把 members 响应接进渲染
+// 成员名单由 members 全量响应初始化，presence 帧增量维护；渲染只依赖 memberCache
 function renderMembers(list) {
+  memberCache = list || memberCache;
   const r = rooms.get(currentRoom); if (!r) return;
-  $('members').innerHTML = '<b>成员</b>' + list.map((m) => {
+  $('members').innerHTML = '<b>成员</b>' + memberCache.map((m) => {
     const muted = m.mutedUntil > Date.now();
     const adminBtns = r.role === 'admin' && m.userId !== me.userId && m.role !== 'admin'
       ? (muted ? `<button data-act="unmute" data-uid="${m.userId}">解禁</button>`
                : `<button data-act="mute" data-uid="${m.userId}">禁言</button>`) : '';
+    const sub = m.online ? '在线' : (m.lastActiveAt ? `最近活跃 ${timeAgo(m.lastActiveAt)}` : '离线');
     return `<div class="m"><span class="dot ${m.online ? 'on' : ''}"></span>
-      ${escapeHtml(m.name)}
-      ${m.role === 'admin' ? '<span class="tag">管理员</span>' : ''}
-      ${muted ? '<span class="tag muted">禁言中</span>' : ''}
+      <span class="info">
+        <span>${escapeHtml(m.name)}
+          ${m.role === 'admin' ? '<span class="tag">管理员</span>' : ''}
+          ${muted ? '<span class="tag muted">禁言中</span>' : ''}</span>
+        <span class="sub">${sub}</span>
+      </span>
       ${adminBtns}</div>`;
   }).join('');
   $('members').querySelectorAll('button').forEach((b) => {
@@ -274,6 +300,21 @@ function renderMembers(list) {
     };
   });
 }
+
+/** 最近活动时间的相对展示 */
+function timeAgo(ts) {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 10) return '刚刚';
+  if (s < 60) return `${s} 秒前`;
+  const min = Math.floor(s / 60);
+  if (min < 60) return `${min} 分钟前`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h} 小时前`;
+  return new Date(ts).toLocaleDateString();
+}
+
+// 离线成员的「最近活跃 x 分钟前」随时间滚动刷新
+setInterval(() => { if (!$('members').classList.contains('hidden')) renderMembers(); }, 30_000);
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
